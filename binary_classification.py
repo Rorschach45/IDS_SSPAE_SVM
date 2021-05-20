@@ -1,11 +1,46 @@
+import argparse
 import tensorflow as tf
 import pandas as pd
 from sklearn import preprocessing
+from sklearn.metrics import accuracy_score
 from sklearn.svm import SVC
 import numpy as np
 from tqdm import tqdm
 from sklearn.feature_selection import mutual_info_regression
 import gc
+
+
+def reduce_mem_usage(df):
+    start_mem = df.memory_usage().sum() / 1024 ** 2
+
+    for col in df.columns:
+        col_type = df[col].dtype
+
+        if col_type != object:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        else:
+            df[col] = df[col].astype('category')
+
+    end_mem = df.memory_usage().sum() / 1024 ** 2
+    print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
+    return df
 
 
 def binary_svm(x_train, y_train, c=10, gamma=4):
@@ -82,9 +117,7 @@ class SupervisedSparseAutoencoder(object):
         diff = X - X_
         diff = tf.matmul(diff ** 2, self.mutual_info)
         diff = tf.reduce_mean(tf.reduce_sum(diff, axis=1))
-        loss = self.rec_reg * diff \
-               + self.kl_reg * kl_d \
-               + self.regular_reg * self.regularization()
+        loss = self.rec_reg * diff + self.kl_reg * kl_d + self.regular_reg * self.regularization()
         return loss
 
     def partial_fit(self, X, mutual_info):
@@ -104,17 +137,23 @@ def batch_maker(x_train, batch_size, batch_count):
     return x_batch
 
 
-def main():
+def pre_train(path_mi, path_z_tr, path_z_te):
     train = pd.read_csv('./data/NSLKDDTrain+/binary.csv', header=None)
-    test = pd.read_csv('./data/NSLKDDTest+/binary.csv', header=None)
+    test_data = pd.read_csv('./data/NSLKDDTest+/binary.csv', header=None)
     x_tr = train.iloc[:, 0:train.shape[1] - 1]
     y_tr = train.iloc[:, train.shape[1] - 1]
-    x_te = test.iloc[:, 0:test.shape[1] - 1]
-    y_te = test.iloc[:, test.shape[1] - 1]
+    x_te = test_data.iloc[:, 0:test_data.shape[1] - 1]
     min_max_scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))
     x_tr = min_max_scaler.fit_transform(x_tr)
     x_te = min_max_scaler.fit_transform(x_te)
-    mi = mutual_info_weight(x_tr, y_tr)
+    x_tr = reduce_mem_usage(pd.DataFrame(x_tr)).values
+    x_te = reduce_mem_usage(pd.DataFrame(x_te)).values
+    del train, test_data
+    gc.collect()
+    if path_mi is None:
+        mi = mutual_info_weight(x_tr, y_tr)
+    else:
+        mi = pd.read_csv(path_mi, header=None).values
     gc.collect()
     n_samples = x_tr.shape[0]
     training_epochs = 1000
@@ -122,18 +161,49 @@ def main():
     display_step = 100
     num_steps = int(training_epochs * n_samples / batch_size)
     gc.collect()
-    autoencoder = SupervisedSparseAutoencoder(
+    auto_encoder = SupervisedSparseAutoencoder(
         n_input=x_tr.shape[1], n_hidden=30, sample_size=batch_size, rho=.5, reconstruct_reg=1,
         kl_reg=3, regular_reg=(0.00000006 / 2), activation=tf.nn.sigmoid)
-
     for i in tqdm(range(num_steps)):
         batch_xs = batch_maker(x_tr, batch_size, i)
-        l = autoencoder.partial_fit(batch_xs, mi)
+        cost = auto_encoder.partial_fit(batch_xs, mi)
         if i % display_step == 0:
-            print("mini_batch:", '%04d' % (i + 1), "cost=", l)
-    z_test = autoencoder.transform(x_te)
-    z_train = autoencoder.transform(x_tr)
-    model = binary_svm(z_train, y_tr)
+            print(" mini_batch:", '%04d' % (i + 1), "cost=", cost)
+    z_test = auto_encoder.transform(x_te)
+    z_train = auto_encoder.transform(x_tr)
+    pd.DataFrame(z_train).to_csv(path_z_tr, header=False, index=False)
+    pd.DataFrame(z_test).to_csv(path_z_te, header=False, index=False)
+
+
+def test(z_tr_path, z_te_path):
+    train = pd.read_csv('./data/NSLKDDTrain+/binary.csv', header=None)
+    test_data = pd.read_csv('./data/NSLKDDTest+/binary.csv', header=None)
+    y_tr = train.iloc[:, train.shape[1] - 1]
+    y_te = test_data.iloc[:, test_data.shape[1] - 1]
+    del test_data, train
+    x_tr = pd.read_csv(z_tr_path, header=None, index_col=None).values
+    x_te = pd.read_csv(z_te_path, header=None, index_col=None).values
+    model = binary_svm(x_tr, y_tr)
+    y_pred = model.predict(x_te)
+    print(f'accuracy_score: {accuracy_score(y_pred, y_te)}')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-option', required=True, choices=['pre_train', 'test'])
+    parser.add_argument('-mi')
+    parser.add_argument('-z_tr')
+    parser.add_argument('-z_te')
+    parser.add_argument('-output', nargs=2)
+    args = parser.parse_args()
+    if args.option == 'pre_train':
+        if args.output is None or len(args.output) != 2:
+            raise Exception('no output file for z_tr and z_te was found')
+        pre_train(args.mi, args.output[0], args.output[1])
+    if args.option == 'test':
+        if args.z_tr is None or args.z_te is None:
+            raise Exception('provide z_tr and z_te')
+        test(args.z_tr, args.z_te)
 
 
 if __name__ == '__main__':
